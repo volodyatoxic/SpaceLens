@@ -8,18 +8,63 @@ struct Tile: Identifiable {
     let container: Bool
 }
 
+/// Порядок плиток, который меняется плавно. Пока идёт синхронизация, плитка может сдвинуться только на соседнее место
+/// за один такт (и только если сосед заметно меньше её) — поэтому всё переезжает как в пазле, без пересечения траекторий.
+/// Новые плитки встают на место по текущему размеру, а когда синхронизация закончилась, порядок досортировывается.
+final class TileOrder {
+    private var rootID: UUID?
+    private var lists: [UUID: [UUID]] = [:]
+    private var stamps: [UUID: Int] = [:]
+    var stamp = 0
+
+    func begin(root: UUID) {
+        if rootID != root { rootID = root; lists = [:]; stamps = [:] }
+    }
+
+    func arrange(_ parent: UUID, _ nodes: [FileNode], settled: Bool) -> [FileNode] {
+        if settled {
+            let s = nodes.sorted { $0.size > $1.size }
+            lists[parent] = s.map(\.id)
+            return s
+        }
+        var byID: [UUID: FileNode] = [:]
+        for n in nodes { byID[n.id] = n }
+        var ids = (lists[parent] ?? []).filter { byID[$0] != nil }
+        let known = Set(ids)
+        for n in nodes.sorted(by: { $0.size > $1.size }) where !known.contains(n.id) {
+            let i = ids.firstIndex { (byID[$0]?.size ?? 0) < n.size } ?? ids.count
+            ids.insert(n.id, at: i)
+        }
+        if stamps[parent] != stamp {
+            stamps[parent] = stamp
+            for parity in 0..<2 {
+                var i = parity
+                while i + 1 < ids.count {
+                    if let a = byID[ids[i]], let b = byID[ids[i + 1]], Double(b.size) > Double(a.size) * 1.15 { ids.swapAt(i, i + 1) }
+                    i += 2
+                }
+            }
+        }
+        lists[parent] = ids
+        return ids.compactMap { byID[$0] }
+    }
+}
+
 enum Treemap {
-    static func layout(_ root: FileNode, in rect: CGRect, nested: Bool) -> [Tile] {
+    static func layout(_ root: FileNode, in rect: CGRect, nested: Bool, order: TileOrder, settled: Bool) -> [Tile] {
         var out: [Tile] = []
-        place(root.children, in: rect, depth: 0, nested: nested, out: &out)
+        order.begin(root: root.id)
+        place(root.children, parent: root.id, in: rect, depth: 0, nested: nested, order: order, settled: settled, out: &out)
         return out
     }
 
     /// Плитка меньше этой площади (pt²) не вместит даже мелкую подпись — такие элементы сливаются в одну плитку «ещё N».
     private static let labelArea = 1800.0
 
-    private static func place(_ nodes: [FileNode], in rect: CGRect, depth: Int, nested: Bool, out: inout [Tile]) {
+    private static func place(_ unordered: [FileNode], parent: UUID, in rect: CGRect, depth: Int, nested: Bool,
+                              order: TileOrder, settled: Bool, out: inout [Tile]) {
         guard rect.width > 8, rect.height > 8, out.count < 700 else { return }
+        let nodes = order.arrange(parent, unordered, settled: settled)
         let total = nodes.reduce(0.0) { $0 + Double($1.size) }
         guard total > 0 else { return }
         let area = Double(rect.width * rect.height)
@@ -39,8 +84,7 @@ enum Treemap {
                                  isDir: false, size: sum, fileCount: small.reduce(0) { $0 + $1.fileCount },
                                  isAggregate: true, id: small[0].id)
                 g.children = small
-                kept.append(g)
-                kept.sort { $0.size > $1.size }
+                kept.insert(g, at: kept.firstIndex { $0.size < g.size } ?? kept.count)
             }
         }
         var placed = squarify(kept, in: rect)
@@ -56,7 +100,7 @@ enum Treemap {
             out.append(Tile(node: n, rect: r, depth: depth, container: nest))
             if nest {
                 let inner = CGRect(x: r.minX + 7, y: r.minY + 28, width: r.width - 14, height: r.height - 35)
-                place(n.children, in: inner, depth: depth + 1, nested: nested, out: &out)
+                place(n.children, parent: n.id, in: inner, depth: depth + 1, nested: nested, order: order, settled: settled, out: &out)
             }
         }
     }
@@ -257,13 +301,19 @@ struct TileView: View {
         .brightness(hover && !tile.container && !isGroup ? 0.07 : 0)
         .contentShape(shape)
         .onHover { hover = $0 }
-        .offset(x: r.minX, y: r.minY)
-        .animation(.easeOut(duration: 0.3), value: tile.rect)
         .help(isGroup ? groupHelp : "\(tile.node.path)\n\(fmtSize(tile.node.size))")
         .onTapGesture(count: 2) { if !isGroup { app.activate(tile.node) } }
         .onTapGesture { if isGroup { showGroup.toggle() } else { app.select(tile.node) } }
         .contextMenu { if !isGroup { NodeMenu(node: tile.node) } }
         .popover(isPresented: $showGroup, arrowEdge: .bottom) { GroupList(group: tile.node, close: { showGroup = false }) }
+        .popover(isPresented: detailBinding, arrowEdge: .bottom) { DetailCard(node: tile.node, onClose: { app.selected = nil }) }
+        .offset(x: r.minX, y: r.minY)
+        .transition(.scale(scale: 0.9).combined(with: .opacity))
+    }
+
+    private var detailBinding: Binding<Bool> {
+        Binding(get: { selected && !isGroup },
+                set: { if !$0, app.selected?.id == tile.node.id { app.selected = nil } })
     }
 
     private var groupHelp: String {
@@ -292,8 +342,22 @@ struct GroupList: View {
     @EnvironmentObject var app: AppState
     let group: FileNode
     let close: () -> Void
+    @State private var picked: FileNode?
 
     var body: some View {
+        if let n = picked {
+            VStack(alignment: .leading, spacing: 0) {
+                Button { picked = nil } label: {
+                    Label("Мелкие элементы", systemImage: "chevron.left")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                }
+                .buttonStyle(.plain).foregroundStyle(.secondary).padding([.top, .leading], 12)
+                DetailCard(node: n, onClose: close)
+            }
+        } else { list }
+    }
+
+    private var list: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 Text("Мелкие элементы · \(group.children.count)").font(.system(size: 12, weight: .bold, design: .rounded))
@@ -304,7 +368,7 @@ struct GroupList: View {
             ScrollView {
                 VStack(spacing: 0) {
                     ForEach(group.children.prefix(80)) { n in
-                        Button { app.select(n); close() } label: {
+                        Button { picked = n } label: {
                             HStack(spacing: 8) {
                                 Image(systemName: n.isDir ? "folder.fill" : "doc.fill").foregroundStyle(.secondary).frame(width: 14)
                                 Text(n.name).lineLimit(1)
@@ -325,7 +389,7 @@ struct GroupList: View {
             }
         }
         .padding(12)
-        .frame(width: 320)
+        .frame(width: 330)
     }
 }
 
@@ -352,7 +416,8 @@ struct TreemapView: View {
     var body: some View {
         GeometryReader { geo in
             if let cur = app.current {
-                let tiles = Treemap.layout(cur, in: CGRect(origin: .zero, size: geo.size).insetBy(dx: 6, dy: 6), nested: app.nested)
+                let tiles = Treemap.layout(cur, in: CGRect(origin: .zero, size: geo.size).insetBy(dx: 6, dy: 6), nested: app.nested,
+                                           order: app.order, settled: !(app.scanning || app.refreshing))
                 ZStack(alignment: .topLeading) {
                     ForEach(tiles) { t in
                         TileView(tile: t, baseFill: app.fill(for: t.node),

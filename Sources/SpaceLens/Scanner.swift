@@ -57,7 +57,7 @@ final class ScanProgress: @unchecked Sendable {
         c.parent = parent
         if depth > 0 && !n.children.isEmpty {
             let floor = n.size / 400
-            let kids = n.children.filter { $0.size > 0 && $0.size >= floor }.sorted { $0.size > $1.size }
+            let kids = n.children.filter { $0.size > 0 && $0.size >= floor }   // порядок обнаружения — плитки не прыгают
             c.children = kids.map { copy($0, depth: depth - 1, parent: c) }
         }
         return c

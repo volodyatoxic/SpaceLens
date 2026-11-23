@@ -51,6 +51,7 @@ final class AppState: ObservableObject {
     @Published var saving = false
 
     // настройки
+    let order = TileOrder()
     @Published var nested: Bool { didSet { UserDefaults.standard.set(nested, forKey: "nested") } }
     @Published var folderHex: String { didSet { UserDefaults.standard.set(folderHex, forKey: "folderHex") } }
     @Published var fileHex: String { didSet { UserDefaults.standard.set(fileHex, forKey: "fileHex") } }
@@ -139,7 +140,8 @@ final class AppState: ObservableObject {
                 self.scanFiles = s.files; self.scanBytes = s.bytes
                 self.scanPath = s.path; self.scanDenied = s.denied
                 if live, let snap = prog.liveSnapshot() {
-                    withAnimation(.easeOut(duration: 0.3)) { self.current = snap }
+                    self.order.stamp += 1
+                    withAnimation(.spring(response: 0.6, dampingFraction: 0.84)) { self.current = snap }
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }

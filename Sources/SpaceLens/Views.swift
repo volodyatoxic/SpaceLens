@@ -34,8 +34,8 @@ struct IconButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 14, weight: .semibold))
-                .frame(width: 34, height: 34)
-                .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(Color.primary.opacity(0.07)))
+                .frame(width: 30, height: 30)
+                .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.primary.opacity(0.07)))
         }
         .buttonStyle(.plain)
         .help(help)
@@ -124,7 +124,6 @@ struct ContentView: View {
                 .overlay(alignment: .bottom) {
                     VStack(spacing: 8) {
                         UndoToast()
-                        if app.root != nil, let n = app.selected { DetailCard(node: n) }
                     }
                     .padding(.horizontal, 14).padding(.bottom, 14)
                     .animation(.spring(response: 0.4, dampingFraction: 0.85), value: app.selected?.id)
@@ -132,7 +131,7 @@ struct ContentView: View {
                 }
                 .animation(.spring(response: 0.4, dampingFraction: 0.85), value: app.scanning || app.refreshing)
             }
-            .padding(.top, 10).padding(.bottom, 12).padding(.horizontal, 12)
+            .padding(.top, 0).padding(.bottom, 12).padding(.horizontal, 12)
         }
         .ignoresSafeArea()
         .sheet(item: $app.review) { req in ReviewSheet(nodes: req.nodes) }
@@ -199,8 +198,8 @@ struct TopBar: View {
                         Image(systemName: "sparkles")
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(ai.active ? Color.white : Color.primary)
-                            .frame(width: 34, height: 34)
-                            .background(RoundedRectangle(cornerRadius: 11, style: .continuous)
+                            .frame(width: 30, height: 30)
+                            .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
                                 .fill(ai.active ? Color.purple : Color.primary.opacity(0.07)))
                     }
                     .buttonStyle(.plain).disabled(app.busy)
@@ -214,10 +213,11 @@ struct TopBar: View {
 
             StatusText()
         }
-        .frame(height: 36)
+        .frame(height: 32)
     }
 }
 
+/// Кольцо «сколько занято» и одно число — сколько свободно. Подробности (и время синхронизации) — во всплывающей подсказке.
 struct StatusText: View {
     @EnvironmentObject var app: AppState
     private static let rel: RelativeDateTimeFormatter = {
@@ -227,20 +227,39 @@ struct StatusText: View {
         return f
     }()
 
-    var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { _ in
-            VStack(alignment: .trailing, spacing: 1) {
-                Text("свободно \(fmtSize(app.diskFree))")
-                    .font(.system(size: 12, design: .rounded)).foregroundStyle(.secondary)
-                if app.scanning || app.refreshing {
-                    Text("синхронизация…").font(.system(size: 10.5, design: .rounded)).foregroundStyle(.tertiary)
-                } else if let d = app.lastSync {
-                    Text(d == .distantPast ? "индекс устарел" : Date().timeIntervalSince(d) < 60 ? "обновлено только что" : "обновлено " + Self.rel.localizedString(for: d, relativeTo: Date()))
-                        .font(.system(size: 10.5, design: .rounded)).foregroundStyle(.tertiary)
-                }
-            }
-            .help(app.syncNote)
+    private var used: Double {
+        guard app.diskTotal > 0 else { return 0 }
+        return min(1, max(0, Double(app.diskTotal - app.diskFree) / Double(app.diskTotal)))
+    }
+    private var tint: Color { used > 0.92 ? .red : (used > 0.8 ? .orange : Color.accentColor) }
+
+    private var tip: String {
+        var s = "Занято \(fmtSize(app.diskTotal - app.diskFree)) из \(fmtSize(app.diskTotal)) (\(Int((used * 100).rounded()))%)\nСвободно \(fmtSize(app.diskFree))"
+        if app.scanning || app.refreshing { s += "\nСинхронизация…" }
+        else if let d = app.lastSync {
+            s += d == .distantPast ? "\nИндекс устарел" : "\nОбновлено " + (Date().timeIntervalSince(d) < 60 ? "только что" : Self.rel.localizedString(for: d, relativeTo: Date()))
         }
+        if !app.syncNote.isEmpty { s += "\n" + app.syncNote }
+        return s
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if app.diskTotal > 0 {
+                ZStack {
+                    Circle().stroke(Color.primary.opacity(0.12), lineWidth: 4)
+                    Circle().trim(from: 0, to: used)
+                        .stroke(tint.gradient, style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .animation(.easeOut(duration: 0.6), value: used)
+                }
+                .frame(width: 24, height: 24)
+            }
+            Text(fmtSize(app.diskFree))
+                .font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+                .foregroundStyle(.secondary)
+        }
+        .help(tip)
     }
 }
 
@@ -375,45 +394,51 @@ struct ScanningView: View {
 
 // MARK: - Карточка выбранного элемента
 
+/// Карточка выбранного элемента — показывается выпадающей модалкой у самой плитки.
 struct DetailCard: View {
     @EnvironmentObject var app: AppState
     @EnvironmentObject var ai: AIState
     let node: FileNode
+    var onClose: (() -> Void)? = nil
 
     var body: some View {
         let v = Safety.shared.verdict(for: node)
-        HStack(spacing: 12) {
-            FileIcon(node: node, size: 38)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 8) {
-                    Text(node.name).font(.system(size: 14, weight: .semibold, design: .rounded)).lineLimit(1)
-                    Text(fmtSize(node.size)).font(.system(size: 14, weight: .bold, design: .rounded)).foregroundStyle(Color.accentColor)
-                    RiskChip(risk: v.risk)
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                FileIcon(node: node, size: 38)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(node.name).font(.system(size: 14, weight: .semibold, design: .rounded)).lineLimit(2)
+                    HStack(spacing: 8) {
+                        Text(fmtSize(node.size)).font(.system(size: 13, weight: .bold, design: .rounded)).foregroundStyle(Color.accentColor)
+                        RiskChip(risk: v.risk)
+                    }
                 }
-                if let m = ai.marks[node.id], !m.reason.isEmpty {
-                    Text("ИИ: " + m.reason).font(.system(size: 11.5, design: .rounded)).foregroundStyle(m.color).lineLimit(2)
-                } else {
-                    Text(v.reason).font(.system(size: 11.5, design: .rounded)).foregroundStyle(.secondary).lineLimit(2)
-                }
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 8)
-            IconButton(symbol: "magnifyingglass", help: "Показать в Finder") { app.reveal(node) }
-            if app.canTrash(node) {
-                Button { app.requestTrash([node]) } label: {
-                    Label("В Корзину", systemImage: "trash")
-                }
-                .buttonStyle(PillButton(tint: .red, prominent: true)).fixedSize()
+            if let m = ai.marks[node.id], !m.reason.isEmpty {
+                Text("ИИ: " + m.reason).font(.system(size: 12, design: .rounded)).foregroundStyle(m.color)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
-                Image(systemName: "lock.fill").foregroundStyle(.red).help("Удаление заблокировано правилами безопасности")
-                    .frame(width: 34)
+                Text(v.reason).font(.system(size: 12, design: .rounded)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            IconButton(symbol: "xmark", help: "Закрыть") { app.selected = nil }
+            HStack(spacing: 8) {
+                IconButton(symbol: "magnifyingglass", help: "Показать в Finder") { app.reveal(node) }
+                Spacer(minLength: 0)
+                if app.canTrash(node) {
+                    Button { onClose?(); app.requestTrash([node]) } label: {
+                        Label("В Корзину", systemImage: "trash")
+                    }
+                    .buttonStyle(PillButton(tint: .red, prominent: true)).fixedSize()
+                } else {
+                    Label("Удаление заблокировано", systemImage: "lock.fill")
+                        .font(.system(size: 12, weight: .medium, design: .rounded)).foregroundStyle(.red)
+                        .help("Удаление заблокировано правилами безопасности")
+                }
+            }
         }
-        .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(Color.primary.opacity(0.1)))
-        .shadow(color: .black.opacity(0.2), radius: 14, y: 4)
-        .transition(.move(edge: .bottom).combined(with: .opacity))
+        .padding(14)
+        .frame(width: 330, alignment: .leading)
     }
 }
 
