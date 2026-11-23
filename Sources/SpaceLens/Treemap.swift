@@ -15,13 +15,34 @@ enum Treemap {
         return out
     }
 
+    /// Плитка меньше этой площади (pt²) не вместит даже мелкую подпись — такие элементы сливаются в одну плитку «ещё N».
+    private static let labelArea = 1800.0
+
     private static func place(_ nodes: [FileNode], in rect: CGRect, depth: Int, nested: Bool, out: inout [Tile]) {
         guard rect.width > 8, rect.height > 8, out.count < 700 else { return }
         let total = nodes.reduce(0.0) { $0 + Double($1.size) }
         guard total > 0 else { return }
         let area = Double(rect.width * rect.height)
-        let minArea: Double = depth == 0 ? 800 : 1000
-        var kept = nodes.filter { Double($0.size) / total * area >= minArea }
+        func share(_ n: FileNode) -> Double { Double(n.size) / total * area }
+
+        var big = nodes.filter { share($0) >= labelArea }
+        var small = nodes.filter { share($0) < labelArea }
+        if small.count == 1 {
+            if share(small[0]) >= 800 { big.append(small[0]) }
+            small = []
+        }
+        var kept = big
+        if small.count >= 2 {
+            let sum = small.reduce(Int64(0)) { $0 + $1.size }
+            if Double(sum) / total * area >= 900 {
+                let g = FileNode(url: small[0].parent?.url ?? small[0].url, name: "ещё \(fmtCount(small.count))",
+                                 isDir: false, size: sum, fileCount: small.reduce(0) { $0 + $1.fileCount },
+                                 isAggregate: true, id: small[0].id)
+                g.children = small
+                kept.append(g)
+                kept.sort { $0.size > $1.size }
+            }
+        }
         var placed = squarify(kept, in: rect)
         // Убираем «щепки»: плитки тоньше 22 pt и пересчитываем раскладку без них.
         for _ in 0..<4 {
@@ -84,6 +105,68 @@ enum Treemap {
     }
 }
 
+/// Подбор однострочной подписи: шрифт растёт с размером плитки, а когда текста много — сначала уменьшаем шрифт
+/// (до 7 pt), потом сокращаем размер («8,94 GB» → «8.9G»), потом имя («Visual Studio Code.app» → «Visual Stu…»).
+enum TileLabel {
+    struct Result { var name: String; var size: String?; var font: CGFloat }
+
+    private static func nsFont(_ s: CGFloat) -> NSFont {
+        let f = NSFont.systemFont(ofSize: s, weight: .semibold)
+        return f.fontDescriptor.withDesign(.rounded).flatMap { NSFont(descriptor: $0, size: s) } ?? f
+    }
+    static func width(_ t: String, _ s: CGFloat) -> CGFloat {
+        ceil((t as NSString).size(withAttributes: [.font: nsFont(s)]).width * 1.09)
+    }
+
+    static func shortName(_ n: String) -> String {
+        var t = n
+        for suf in [".app", ".localized"] where t.lowercased().hasSuffix(suf) && t.count > suf.count + 1 { t.removeLast(suf.count) }
+        return t
+    }
+
+    static func compact(_ b: Int64) -> String {
+        let d = Double(b)
+        if d >= 1e9 { return d >= 99.95e9 ? String(format: "%.0fG", d / 1e9) : String(format: "%.1fG", d / 1e9) }
+        if d >= 1e6 { return String(format: "%.0fM", d / 1e6) }
+        if d >= 1e3 { return String(format: "%.0fK", d / 1e3) }
+        return "\(b)B"
+    }
+
+    private static func truncated(_ t: String, to w: CGFloat, font: CGFloat) -> String? {
+        if width(t, font) <= w { return t }
+        var lo = 0, hi = t.count
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if width(String(t.prefix(mid)) + "…", font) <= w { lo = mid } else { hi = mid - 1 }
+        }
+        return lo >= 2 ? String(t.prefix(lo)).trimmingCharacters(in: .whitespaces) + "…" : nil
+    }
+
+    /// `base` — желаемый размер шрифта по размеру плитки; `avail` — ширина под текст; `height` — высота под строку.
+    static func fit(name: String, bytes: Int64, avail: CGFloat, height: CGFloat, pad: CGFloat, base: CGFloat) -> Result? {
+        let gap: CGFloat = 6
+        let nm = shortName(name), full = fmtSize(bytes), comp = compact(bytes)
+        var fonts: [CGFloat] = []
+        for k in [1.0, 0.88, 0.78, 0.0] as [CGFloat] {
+            let f = k == 0 ? 7 : max(7, base * k)
+            if !fonts.contains(f) { fonts.append(f) }
+        }
+        let viable = fonts.filter { $0 * 1.3 + pad * 1.2 <= height }
+        guard let smallest = viable.last else { return nil }
+        for f in viable {
+            for sz in [full, comp] where width(nm, f) + gap + width(sz, f) <= avail {
+                return Result(name: nm, size: sz, font: f)
+            }
+        }
+        let f = smallest
+        let room = avail - gap - width(comp, f)
+        if room > 0, let t = truncated(nm, to: room, font: f), t.count >= 3 { return Result(name: t, size: comp, font: f) }
+        if let t = truncated(nm, to: avail, font: f) { return Result(name: t, size: nil, font: f) }
+        if width(comp, f) <= avail { return Result(name: "", size: comp, font: f) }
+        return nil
+    }
+}
+
 struct TileView: View {
     @EnvironmentObject var app: AppState
     @EnvironmentObject var ai: AIState
@@ -91,6 +174,9 @@ struct TileView: View {
     let baseFill: Color
     let selected: Bool
     @State private var hover = false
+    @State private var showGroup = false
+
+    private var isGroup: Bool { tile.node.isAggregate && !tile.node.children.isEmpty }
 
     var body: some View {
         let mark = ai.marks[tile.node.id]
@@ -98,46 +184,61 @@ struct TileView: View {
         let r = tile.rect.insetBy(dx: 1.5, dy: 1.5)
         let radius = min(tile.depth == 0 ? 16.0 : (tile.depth == 1 ? 11.0 : 8.0), min(r.width, r.height) / 4)
         let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        let minSide = min(r.width, r.height)
+        let base = min(12, max(7, 5.5 + 0.065 * minSide))
+        let pad = min(8, max(3, base * 0.7))
+        let badge = mark != nil && r.width >= 44 && r.height >= 30
         ZStack(alignment: .topLeading) {
             if tile.container {
                 shape.fill(fill.opacity(0.20))
                 shape.strokeBorder(fill.opacity(0.55), lineWidth: 1)
-                HStack(spacing: 6) {
-                    Text(tile.node.name).lineLimit(1)
-                    Spacer(minLength: 4)
-                    Text(fmtSize(tile.node.size)).opacity(0.75)
+                let hp: CGFloat = 10
+                if let L = TileLabel.fit(name: tile.node.name, bytes: tile.node.size,
+                                         avail: r.width - 2 * hp - (badge ? 28 : 0), height: 28, pad: 7,
+                                         base: min(11.5, base)) {
+                    labelRow(L, width: r.width - 2 * hp - (badge ? 28 : 0))
+                        .foregroundStyle(.primary.opacity(0.9))
+                        .padding(.leading, hp).padding(.top, 7)
                 }
-                .font(.system(size: 11.5, weight: .semibold, design: .rounded))
-                .foregroundStyle(.primary.opacity(0.9))
-                .padding(.horizontal, 10).padding(.top, 7)
             } else {
-                shape.fill(LinearGradient(colors: [fill.shade(0.02), fill.shade(0.30)],
-                                          startPoint: .topLeading, endPoint: .bottomTrailing))
-                shape.strokeBorder(.white.opacity(0.18), lineWidth: 0.8)
-                if r.width >= 52 && r.height >= 30 {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(tile.node.name)
-                            .font(.system(size: 12, weight: .semibold, design: .rounded))
-                            .lineLimit(r.height > 64 ? 2 : 1)
-                        Text(fmtSize(tile.node.size))
-                            .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                            .opacity(0.8)
-                    }
-                    .foregroundStyle(.white)
-                    .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
-                    .padding(8)
+                if isGroup {
+                    shape.fill(Color.white.opacity(hover ? 0.12 : 0.07))
+                    shape.strokeBorder(.white.opacity(0.22), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                } else {
+                    shape.fill(LinearGradient(colors: [fill.shade(0.02), fill.shade(0.30)],
+                                              startPoint: .topLeading, endPoint: .bottomTrailing))
+                    shape.strokeBorder(.white.opacity(0.18), lineWidth: 0.8)
                 }
-                if let img = IconCache.real(for: tile.node), r.width >= 64, r.height >= 52 {
-                    let side = min(max(min(r.width, r.height) * 0.42, 24), 72)
+                let avail = r.width - 2 * pad - (badge ? 28 : 0)
+                let L = TileLabel.fit(name: tile.node.name, bytes: tile.node.size, avail: avail,
+                                      height: r.height, pad: pad, base: base)
+                if let L {
+                    labelRow(L, width: avail)
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.35), radius: 1.5, y: 0.5)
+                        .padding(.leading, pad).padding(.top, pad)
+                }
+                // Иконка — только если не залезает на текст: ей достаётся место под строкой подписи.
+                let band = L.map { pad + $0.font * 1.3 + 4 } ?? 0
+                let side = min(max(minSide * 0.42, 24), 72, r.height - band - 8, r.width - 16)
+                if isGroup {
+                    if side >= 26 {
+                        Image(systemName: "square.grid.3x3.fill")
+                            .font(.system(size: min(side * 0.7, 40), weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.22))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                            .padding(10)
+                    }
+                } else if let img = IconCache.real(for: tile.node), side >= 20 {
                     Image(nsImage: img)
                         .resizable().interpolation(.high).scaledToFit()
                         .frame(width: side, height: side)
                         .shadow(color: .black.opacity(0.3), radius: 3, y: 1.5)
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                         .padding(8)
-                } else if r.width >= 110 && r.height >= 84 {
+                } else if side >= 30 && r.width >= 110 && r.height >= 84 {
                     Image(systemName: FileKind.of(tile.node).symbol)
-                        .font(.system(size: min(min(r.width, r.height) * 0.26, 64), weight: .semibold))
+                        .font(.system(size: min(minSide * 0.26, 64, side), weight: .semibold))
                         .foregroundStyle(.white.opacity(0.16))
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                         .padding(10)
@@ -146,22 +247,85 @@ struct TileView: View {
             if selected {
                 shape.strokeBorder(.white, lineWidth: 2.5).shadow(color: fill.opacity(0.9), radius: 8)
             }
-            if let m = mark, r.width >= 44, r.height >= 30 {
+            if let m = mark, badge {
                 AIBadge(s: m)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .padding(6)
             }
         }
         .frame(width: max(r.width, 1), height: max(r.height, 1))
-        .brightness(hover && !tile.container ? 0.07 : 0)
+        .brightness(hover && !tile.container && !isGroup ? 0.07 : 0)
         .contentShape(shape)
         .onHover { hover = $0 }
         .offset(x: r.minX, y: r.minY)
         .animation(.easeOut(duration: 0.3), value: tile.rect)
-        .help("\(tile.node.path)\n\(fmtSize(tile.node.size))")
-        .onTapGesture(count: 2) { app.activate(tile.node) }
-        .onTapGesture { app.select(tile.node) }
-        .contextMenu { NodeMenu(node: tile.node) }
+        .help(isGroup ? groupHelp : "\(tile.node.path)\n\(fmtSize(tile.node.size))")
+        .onTapGesture(count: 2) { if !isGroup { app.activate(tile.node) } }
+        .onTapGesture { if isGroup { showGroup.toggle() } else { app.select(tile.node) } }
+        .contextMenu { if !isGroup { NodeMenu(node: tile.node) } }
+        .popover(isPresented: $showGroup, arrowEdge: .bottom) { GroupList(group: tile.node, close: { showGroup = false }) }
+    }
+
+    private var groupHelp: String {
+        let items = tile.node.children.prefix(12).map { "\($0.name) — \(fmtSize($0.size))" }.joined(separator: "\n")
+        let more = tile.node.children.count > 12 ? "\n…и ещё \(tile.node.children.count - 12)" : ""
+        return "Мелкие элементы: \(fmtSize(tile.node.size))\n" + items + more
+    }
+
+    @ViewBuilder
+    private func labelRow(_ L: TileLabel.Result, width: CGFloat) -> some View {
+        HStack(spacing: 6) {
+            if !L.name.isEmpty { Text(L.name).lineLimit(1) }
+            if let sz = L.size {
+                if !L.name.isEmpty { Spacer(minLength: 0) }
+                Text(sz).lineLimit(1).opacity(0.78)
+            }
+        }
+        .font(.system(size: L.font, weight: .semibold, design: .rounded))
+        .minimumScaleFactor(0.9)
+        .frame(width: max(width, 1), alignment: .leading)
+    }
+}
+
+/// Список мелких элементов, которые не поместились на карте отдельными плитками.
+struct GroupList: View {
+    @EnvironmentObject var app: AppState
+    let group: FileNode
+    let close: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Мелкие элементы · \(group.children.count)").font(.system(size: 12, weight: .bold, design: .rounded))
+                Spacer(minLength: 16)
+                Text(fmtSize(group.size)).font(.system(size: 12, weight: .semibold, design: .rounded)).foregroundStyle(.secondary)
+            }
+            .padding(.bottom, 4)
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(group.children.prefix(80)) { n in
+                        Button { app.select(n); close() } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: n.isDir ? "folder.fill" : "doc.fill").foregroundStyle(.secondary).frame(width: 14)
+                                Text(n.name).lineLimit(1)
+                                Spacer(minLength: 12)
+                                Text(fmtSize(n.size)).foregroundStyle(.secondary)
+                            }
+                            .font(.system(size: 12, design: .rounded))
+                            .padding(.vertical, 4).padding(.horizontal, 6)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .frame(maxHeight: 280)
+            if group.children.count > 80 {
+                Text("…и ещё \(group.children.count - 80)").font(.system(size: 11, design: .rounded)).foregroundStyle(.tertiary)
+            }
+        }
+        .padding(12)
+        .frame(width: 320)
     }
 }
 
