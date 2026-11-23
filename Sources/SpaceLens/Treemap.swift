@@ -152,7 +152,7 @@ enum Treemap {
 /// Подбор однострочной подписи: шрифт растёт с размером плитки, а когда текста много — сначала уменьшаем шрифт
 /// (до 7 pt), потом сокращаем размер («8,94 GB» → «8.9G»), потом имя («Visual Studio Code.app» → «Visual Stu…»).
 enum TileLabel {
-    struct Result { var name: String; var size: String?; var font: CGFloat }
+    struct Result { var name: String; var size: String?; var font: CGFloat; var lines: [(String, String)]? }
 
     private static func nsFont(_ s: CGFloat) -> NSFont {
         let f = NSFont.systemFont(ofSize: s, weight: .semibold)
@@ -186,27 +186,64 @@ enum TileLabel {
         return lo >= 2 ? String(t.prefix(lo)).trimmingCharacters(in: .whitespaces) + "…" : nil
     }
 
-    /// `base` — желаемый размер шрифта по размеру плитки; `avail` — ширина под текст; `height` — высота под строку.
-    static func fit(name: String, bytes: Int64, avail: CGFloat, height: CGFloat, pad: CGFloat, base: CGFloat) -> Result? {
+    /// Перенос «название + размер» в несколько строк: по словам, а слово, которое не влезло целиком, — по буквам.
+    /// Размер идёт сразу после названия и не рвётся.
+    private static func wrap(name: String, sizes: [String], f: CGFloat, avail: CGFloat) -> [(String, String)]? {
+        var lines: [(String, String)] = []
+        var cur = ""
+        for word in name.split(separator: " ", omittingEmptySubsequences: true).map(String.init) {
+            let cand = cur.isEmpty ? word : cur + " " + word
+            if width(cand, f) <= avail { cur = cand; continue }
+            if !cur.isEmpty { lines.append((cur, "")); cur = "" }
+            if width(word, f) <= avail { cur = word; continue }
+            var chunk = ""
+            for ch in word {
+                if width(chunk + String(ch), f) <= avail { chunk.append(ch) }
+                else {
+                    if chunk.isEmpty { return nil }
+                    lines.append((chunk, "")); chunk = String(ch)
+                }
+            }
+            cur = chunk
+        }
+        guard let sz = sizes.first(where: { width($0, f) <= avail }) else { return nil }
+        if cur.isEmpty { lines.append(("", sz)) }
+        else if width(cur + " " + sz, f) <= avail { lines.append((cur, " " + sz)) }
+        else { lines.append((cur, "")); lines.append(("", sz)) }
+        return lines
+    }
+
+    /// `base` — желаемый размер шрифта по размеру плитки; `avail` — ширина под текст; `height` — высота под подпись.
+    /// `flow` — можно ли переносить на несколько строк (у заголовков вложенных папок нельзя).
+    static func fit(name: String, bytes: Int64, avail: CGFloat, height: CGFloat, pad: CGFloat, base: CGFloat,
+                    flow: Bool = false) -> Result? {
         let gap: CGFloat = 6
         let nm = shortName(name), full = fmtSize(bytes), comp = compact(bytes)
         var fonts: [CGFloat] = []
-        for k in [1.0, 0.88, 0.78, 0.0] as [CGFloat] {
-            let f = k == 0 ? 7 : max(7, base * k)
+        var k: CGFloat = 1
+        while true {
+            let f = max(7, base * k)
             if !fonts.contains(f) { fonts.append(f) }
+            if f <= 7 { break }
+            k -= 0.06
         }
         let viable = fonts.filter { $0 * 1.3 + pad * 1.2 <= height }
         guard let smallest = viable.last else { return nil }
+        // Чем крупнее шрифт, тем лучше: на каждом размере сначала одна строка, потом перенос по буквам.
         for f in viable {
             for sz in [full, comp] where width(nm, f) + gap + width(sz, f) <= avail {
-                return Result(name: nm, size: sz, font: f)
+                return Result(name: nm, size: sz, font: f, lines: nil)
+            }
+            if flow, let ls = wrap(name: nm, sizes: [full, comp], f: f, avail: avail),
+               CGFloat(ls.count) * f * 1.2 + pad * 1.4 <= height {
+                return Result(name: nm, size: full, font: f, lines: ls)
             }
         }
         let f = smallest
         let room = avail - gap - width(comp, f)
-        if room > 0, let t = truncated(nm, to: room, font: f), t.count >= 3 { return Result(name: t, size: comp, font: f) }
-        if let t = truncated(nm, to: avail, font: f) { return Result(name: t, size: nil, font: f) }
-        if width(comp, f) <= avail { return Result(name: "", size: comp, font: f) }
+        if room > 0, let t = truncated(nm, to: room, font: f), t.count >= 3 { return Result(name: t, size: comp, font: f, lines: nil) }
+        if let t = truncated(nm, to: avail, font: f) { return Result(name: t, size: nil, font: f, lines: nil) }
+        if width(comp, f) <= avail { return Result(name: "", size: comp, font: f, lines: nil) }
         return nil
     }
 }
@@ -255,7 +292,7 @@ struct TileView: View {
                 }
                 let avail = r.width - 2 * pad - (badge ? 28 : 0)
                 let L = TileLabel.fit(name: tile.node.name, bytes: tile.node.size, avail: avail,
-                                      height: r.height, pad: pad, base: base)
+                                      height: r.height, pad: pad, base: base, flow: true)
                 if let L {
                     labelRow(L, width: avail)
                         .foregroundStyle(.white)
@@ -263,7 +300,7 @@ struct TileView: View {
                         .padding(.leading, pad).padding(.top, pad)
                 }
                 // Иконка — только если не залезает на текст: ей достаётся место под строкой подписи.
-                let band = L.map { pad + $0.font * 1.3 + 4 } ?? 0
+                let band = L.map { pad + CGFloat($0.lines?.count ?? 1) * $0.font * 1.25 + 4 } ?? 0
                 let side = min(max(minSide * 0.42, 24), 72, r.height - band - 8, r.width - 16)
                 if isGroup {
                     if side >= 26 {
@@ -305,8 +342,8 @@ struct TileView: View {
         .onTapGesture(count: 2) { if !isGroup { app.activate(tile.node) } }
         .onTapGesture { if isGroup { showGroup.toggle() } else { app.select(tile.node) } }
         .contextMenu { if !isGroup { NodeMenu(node: tile.node) } }
-        .popover(isPresented: $showGroup, arrowEdge: .bottom) { GroupList(group: tile.node, close: { showGroup = false }) }
-        .popover(isPresented: detailBinding, arrowEdge: .bottom) { DetailCard(node: tile.node, onClose: { app.selected = nil }) }
+        .popover(isPresented: $showGroup, attachmentAnchor: .point(.center), arrowEdge: .bottom) { GroupList(group: tile.node, close: { showGroup = false }) }
+        .popover(isPresented: detailBinding, attachmentAnchor: .point(.center), arrowEdge: .bottom) { DetailCard(node: tile.node, onClose: { app.selected = nil }) }
         .offset(x: r.minX, y: r.minY)
         .transition(.scale(scale: 0.9).combined(with: .opacity))
     }
@@ -324,6 +361,16 @@ struct TileView: View {
 
     @ViewBuilder
     private func labelRow(_ L: TileLabel.Result, width: CGFloat) -> some View {
+        if let lines = L.lines {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, ln in
+                    (Text(ln.0) + Text(ln.1).foregroundColor(.white.opacity(0.75)))
+                        .lineLimit(1).fixedSize()
+                }
+            }
+            .font(.system(size: L.font, weight: .semibold, design: .rounded))
+            .frame(width: max(width, 1), alignment: .leading)
+        } else {
         HStack(spacing: 6) {
             if !L.name.isEmpty { Text(L.name).lineLimit(1) }
             if let sz = L.size {
@@ -334,6 +381,7 @@ struct TileView: View {
         .font(.system(size: L.font, weight: .semibold, design: .rounded))
         .minimumScaleFactor(0.9)
         .frame(width: max(width, 1), alignment: .leading)
+        }
     }
 }
 

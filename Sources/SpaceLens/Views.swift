@@ -131,7 +131,7 @@ struct ContentView: View {
                 }
                 .animation(.spring(response: 0.4, dampingFraction: 0.85), value: app.scanning || app.refreshing)
             }
-            .padding(.top, 0).padding(.bottom, 12).padding(.horizontal, 12)
+            .padding(.top, 34).padding(.bottom, 14).padding(.horizontal, 14)
         }
         .ignoresSafeArea()
         .sheet(item: $app.review) { req in ReviewSheet(nodes: req.nodes) }
@@ -167,9 +167,6 @@ struct TopBar: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            // место для светофора окна
-            Color.clear.frame(width: 64, height: 1)
-
             Menu {
                 Button("Домашняя папка") { app.scan(home) }
                 Button("Весь диск") { app.scan(URL(fileURLWithPath: "/")) }
@@ -205,7 +202,7 @@ struct TopBar: View {
                     .buttonStyle(.plain).disabled(app.busy)
                     .help("Рекомендации ИИ: что можно удалить")
                 }
-                IconButton(symbol: "arrow.triangle.2.circlepath", help: "Синхронизировать заново (полный скан, индекс игнорируется)") { app.rescan() }
+                IconButton(symbol: "arrow.triangle.2.circlepath", help: app.rescanHelp) { app.rescan() }
                     .disabled(app.scanning)
             }
             IconButton(symbol: "slider.horizontal.3", help: "Настройки") { showSettings.toggle() }
@@ -423,7 +420,7 @@ struct DetailCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 8) {
-                IconButton(symbol: "magnifyingglass", help: "Показать в Finder") { app.reveal(node) }
+                IconButton(symbol: "folder", help: "Показать в Finder") { app.reveal(node) }
                 Spacer(minLength: 0)
                 if app.canTrash(node) {
                     Button { onClose?(); app.requestTrash([node]) } label: {

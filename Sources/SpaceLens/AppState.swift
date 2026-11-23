@@ -117,8 +117,74 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Кнопка «синхронизировать»: всё заново, индекс игнорируется.
-    func rescan() { if let u = scanRoot { scan(u, force: true) } }
+    /// Кнопка «синхронизировать»: в корне — всё заново (индекс игнорируется), внутри папки — только эта папка.
+    func rescan() {
+        if let cur = current, let r = root, cur !== r, cur.parent != nil, !busy { resync(cur) }
+        else if let u = scanRoot { scan(u, force: true) }
+    }
+
+    var rescanHelp: String {
+        if let cur = current, let r = root, cur !== r { return "Пересканировать «\(cur.name)» заново" }
+        return "Синхронизировать всё заново (полный скан, индекс игнорируется)"
+    }
+
+    private var resyncNode: FileNode?
+
+    /// Полный перескан одной папки: карта достраивается на глазах, потом результат встаёт на место старого поддерева.
+    private func resync(_ node: FileNode) {
+        guard let parent = node.parent, let rootNode = root, let rootURL = scanRoot else { return }
+        progress?.cancel(); pollTask?.cancel()
+        let prog = ScanProgress()
+        progress = prog
+        resyncNode = node
+        selected = nil; lastTrash = nil
+        scanFiles = 0; scanBytes = 0; scanPath = ""; scanDenied = 0
+        refreshing = true
+        ai.reset()
+        let url = node.url
+        let oldSize = node.size, oldFiles = node.fileCount
+
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let s = prog.snapshot()
+                self.scanFiles = s.files; self.scanBytes = s.bytes
+                self.scanPath = s.path; self.scanDenied = s.denied
+                if let snap = prog.liveSnapshot() {
+                    snap.parent = parent
+                    self.order.stamp += 1
+                    withAnimation(.spring(response: 0.6, dampingFraction: 0.84)) { self.current = snap }
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let tree = DiskScanner.scan(root: url, old: nil, force: true, progress: prog)
+            await MainActor.run {
+                guard let self, self.progress === prog else { return }
+                self.pollTask?.cancel()
+                self.refreshing = false
+                self.resyncNode = nil
+                if prog.isCancelled { return }
+                tree.parent = parent
+                if let i = parent.children.firstIndex(where: { $0 === node }) { parent.children[i] = tree }
+                else { parent.children.append(tree) }
+                self.adjust(parent, size: tree.size - oldSize, files: tree.fileCount - oldFiles)
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.88)) { self.current = tree }
+                self.syncNote = "Папка «\(tree.name)» пересканирована заново"
+                self.refreshDisk(rootURL)
+                // индекс сохраняем с прежней датой: остальное дерево не обновлялось, свежим его считать нельзя
+                let loaded = self.memCache[rootURL.path]
+                let date = loaded?.date ?? self.lastSync ?? Date()
+                let rd = loaded?.read ?? 0, ru = loaded?.reused ?? 0
+                self.saving = true
+                Task.detached(priority: .utility) {
+                    Cache.save(rootNode, rootPath: rootURL.path, date: date, read: rd, reused: ru)
+                    await MainActor.run { self.saving = false }
+                }
+            }
+        }
+    }
 
     func restoreLast() {
         guard root == nil, !scanning, let p = UserDefaults.standard.string(forKey: "lastRoot"),
@@ -187,6 +253,7 @@ final class AppState: ObservableObject {
         progress?.cancel()
         pollTask?.cancel()
         let hadData = root != nil
+        if let n = resyncNode { current = n; resyncNode = nil }
         scanning = false; refreshing = false
         if !hadData { current = nil; scanRoot = nil }
     }
