@@ -153,7 +153,7 @@ final class AppState: ObservableObject {
                 if let snap = prog.liveSnapshot() {
                     snap.parent = parent
                     self.order.stamp += 1
-                    withAnimation(.spring(response: 0.6, dampingFraction: 0.84)) { self.current = snap }
+                    withAnimation(.easeOut(duration: 0.22)) { self.current = snap }
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
@@ -170,7 +170,7 @@ final class AppState: ObservableObject {
                 if let i = parent.children.firstIndex(where: { $0 === node }) { parent.children[i] = tree }
                 else { parent.children.append(tree) }
                 self.adjust(parent, size: tree.size - oldSize, files: tree.fileCount - oldFiles)
-                withAnimation(.spring(response: 0.5, dampingFraction: 0.88)) { self.current = tree }
+                withAnimation(.easeOut(duration: 0.25)) { self.current = tree }
                 self.syncNote = "Папка «\(tree.name)» пересканирована заново"
                 self.refreshDisk(rootURL)
                 // индекс сохраняем с прежней датой: остальное дерево не обновлялось, свежим его считать нельзя
@@ -207,7 +207,7 @@ final class AppState: ObservableObject {
                 self.scanPath = s.path; self.scanDenied = s.denied
                 if live, let snap = prog.liveSnapshot() {
                     self.order.stamp += 1
-                    withAnimation(.spring(response: 0.6, dampingFraction: 0.84)) { self.current = snap }
+                    withAnimation(.easeOut(duration: 0.22)) { self.current = snap }
                 }
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
