@@ -248,31 +248,14 @@ enum TileLabel {
     }
 }
 
-/// Появление подписи/иконки: мягкий «выскок» с задержкой. Скрывается мгновенно.
-struct Reveal: ViewModifier {
-    let on: Bool
-    let delay: Double
-    func body(content: Content) -> some View {
-        content
-            .opacity(on ? 1 : 0)
-            .scaleEffect(on ? 1 : 0.82, anchor: .topLeading)
-            .blur(radius: on ? 0 : 3)
-            .animation(on ? .spring(response: 0.34, dampingFraction: 0.78).delay(delay) : nil, value: on)
-    }
-}
-
 struct TileView: View {
     @EnvironmentObject var app: AppState
     @EnvironmentObject var ai: AIState
     let tile: Tile
     let baseFill: Color
     let selected: Bool
-    var reveal: Bool = true      // подписи и иконки проявляются, когда сетка достроена
     @State private var hover = false
     @State private var showGroup = false
-
-    /// Случайная (но стабильная для плитки) задержка появления подписи, 0…0.55 с.
-    private var delay: Double { Double(abs(tile.node.id.hashValue % 1000)) / 1000 * 0.55 }
 
     private var isGroup: Bool { tile.node.isAggregate && !tile.node.children.isEmpty }
 
@@ -291,7 +274,6 @@ struct TileView: View {
                 shape.fill(fill.opacity(0.20))
                 shape.strokeBorder(fill.opacity(0.55), lineWidth: 1)
                 let hp: CGFloat = 10
-                ZStack(alignment: .topLeading) {
                 if let L = TileLabel.fit(name: tile.node.name, bytes: tile.node.size,
                                          avail: r.width - 2 * hp - (badge ? 28 : 0), height: 28, pad: 7,
                                          base: min(11.5, base)) {
@@ -299,7 +281,6 @@ struct TileView: View {
                         .foregroundStyle(.primary.opacity(0.9))
                         .padding(.leading, hp).padding(.top, 7)
                 }
-                }.modifier(Reveal(on: reveal, delay: delay))
             } else {
                 if isGroup {
                     shape.fill(Color.white.opacity(hover ? 0.12 : 0.07))
@@ -309,7 +290,6 @@ struct TileView: View {
                                               startPoint: .topLeading, endPoint: .bottomTrailing))
                     shape.strokeBorder(.white.opacity(0.18), lineWidth: 0.8)
                 }
-                ZStack(alignment: .topLeading) {
                 let avail = r.width - 2 * pad - (badge ? 28 : 0)
                 let L = TileLabel.fit(name: tile.node.name, bytes: tile.node.size, avail: avail,
                                       height: r.height, pad: pad, base: base, flow: true)
@@ -344,7 +324,6 @@ struct TileView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                         .padding(10)
                 }
-                }.modifier(Reveal(on: reveal, delay: delay))
             }
             if selected {
                 shape.strokeBorder(.white, lineWidth: 2.5).shadow(color: fill.opacity(0.9), radius: 8)
@@ -353,7 +332,6 @@ struct TileView: View {
                 AIBadge(s: m)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .padding(6)
-                    .modifier(Reveal(on: reveal, delay: delay))
             }
         }
         .frame(width: max(r.width, 1), height: max(r.height, 1))
@@ -367,7 +345,7 @@ struct TileView: View {
         .popover(isPresented: $showGroup, attachmentAnchor: .point(.center), arrowEdge: .bottom) { GroupList(group: tile.node, close: { showGroup = false }) }
         .popover(isPresented: detailBinding, attachmentAnchor: .point(.center), arrowEdge: .bottom) { DetailCard(node: tile.node, onClose: { app.selected = nil }) }
         .offset(x: r.minX, y: r.minY)
-        .transition(.opacity)
+        .transition(.scale(scale: 0.9).combined(with: .opacity))
     }
 
     private var detailBinding: Binding<Bool> {
@@ -487,12 +465,11 @@ struct TreemapView: View {
         GeometryReader { geo in
             if let cur = app.current {
                 let tiles = Treemap.layout(cur, in: CGRect(origin: .zero, size: geo.size).insetBy(dx: 6, dy: 6), nested: app.nested,
-                                           order: app.order, settled: true)
+                                           order: app.order, settled: !(app.scanning || app.refreshing))
                 ZStack(alignment: .topLeading) {
                     ForEach(tiles) { t in
                         TileView(tile: t, baseFill: app.fill(for: t.node),
-                                 selected: app.selected?.id == t.node.id,
-                                 reveal: !(app.scanning || app.refreshing))
+                                 selected: app.selected?.id == t.node.id)
                     }
                     if tiles.isEmpty {
                         VStack(spacing: 8) {
