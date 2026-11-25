@@ -17,6 +17,10 @@ struct SpaceLensApp: App {
                     NSApp.activate(ignoringOtherApps: true)
                     app.ai.detect()
                     let args = CommandLine.arguments
+                    if args.contains("--render-demo") {
+                        Task { @MainActor in await DemoRenderer.run(args: args, app: app) }
+                        return
+                    }
                     if let i = args.firstIndex(of: "--scan"), i + 1 < args.count, app.root == nil, !app.scanning {
                         app.scan(URL(fileURLWithPath: args[i + 1]), force: args.contains("--force"))
                     } else {
